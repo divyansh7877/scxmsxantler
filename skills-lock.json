@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "integrating-agent-auth": {
+      "source": "scalekit-inc/skills",
+      "sourceType": "github",
+      "computedHash": "5423e3d113168892dba6f63ded003f035224f6bd47d842336ee18971e1b516ab"
+    }
+  }
+}

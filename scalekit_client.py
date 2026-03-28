@@ -1,14 +1,13 @@
 import os
+import json
 import logging
-import base64
-from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
 from scalekit.client import ScalekitClient
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("scalekit")
 
 IDENTIFIER = os.getenv("IDENTIFIER", "hackathon_user_1")
 CONNECTION_GMAIL = os.getenv("CONNECTION_NAME_GMAIL", "gmail")
@@ -29,16 +28,19 @@ def _get_actions():
                 "Missing Scalekit credentials. Set SCALEKIT_ENV_URL, "
                 "SCALEKIT_CLIENT_ID, SCALEKIT_CLIENT_SECRET in .env"
             )
+        logger.info("[SCALEKIT] Initializing client with env_url=%s", env_url)
         _client = ScalekitClient(
             env_url=env_url,
             client_id=client_id,
             client_secret=client_secret,
         )
+        logger.info("[SCALEKIT] Client initialized successfully")
     return _client.actions
 
 
 def ensure_connected(connection_name: str) -> dict:
     """Check if a connector is authorized. Prints auth link if not ACTIVE."""
+    logger.info(f"[AUTH] Checking connection: {connection_name}")
     try:
         response = _get_actions().get_or_create_connected_account(
             connection_name=connection_name,
@@ -92,41 +94,26 @@ def create_calendar_event(
     if create_meeting_room:
         tool_input["create_meeting_room"] = True
 
+    logger.info(f"[CALENDAR] Creating event: {summary} at {start_datetime}")
+    logger.debug(f"[CALENDAR] Tool input: {json.dumps(tool_input, indent=2)}")
     result = _get_actions().execute_tool(
         tool_name="googlecalendar_create_event",
         identifier=IDENTIFIER,
         tool_input=tool_input,
     )
-    logger.info(f"Calendar event created: {result}")
+    logger.info(f"[CALENDAR] Event created successfully")
+    logger.debug(f"[CALENDAR] Result: {result}")
     return result
 
 
-def send_email(to: str, subject: str, body: str) -> dict:
-    """Send email via Gmail. Tries execute_tool first, falls back to proxy."""
-    # Try optimized tool first
-    try:
-        result = _get_actions().execute_tool(
-            tool_name="gmail_send_email",
-            identifier=IDENTIFIER,
-            tool_input={"to": to, "subject": subject, "body": body},
-        )
-        logger.info(f"Email sent via execute_tool: {result}")
-        return result
-    except Exception as e:
-        logger.warning(f"gmail_send_email tool failed ({e}), falling back to proxy")
-
-    # Fallback: raw proxy with MIME encoding
-    message = MIMEText(body)
-    message["to"] = to
-    message["subject"] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
-    result = _get_actions().request(
-        connection_name=CONNECTION_GMAIL,
+def fetch_emails(query: str = "is:unread", max_results: int = 5) -> dict:
+    """Fetch emails from Gmail via Scalekit optimized tool."""
+    logger.info(f"[GMAIL] Fetching emails: query='{query}', max_results={max_results}")
+    result = _get_actions().execute_tool(
+        tool_name="gmail_fetch_mails",
         identifier=IDENTIFIER,
-        path="/gmail/v1/users/me/messages/send",
-        method="POST",
-        body={"raw": raw},
+        tool_input={"query": query, "max_results": max_results},
     )
-    logger.info(f"Email sent via proxy: {result}")
+    logger.info(f"[GMAIL] Fetched successfully")
+    logger.debug(f"[GMAIL] Result: {result}")
     return result

@@ -9,14 +9,18 @@ from openai import OpenAI
 from scalekit_client import (
     ensure_connected,
     create_calendar_event,
-    send_email,
+    fetch_emails,
     CONNECTION_GMAIL,
     CONNECTION_CALENDAR,
 )
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("do-it-agent")
 
 MEETSTREAM_API_KEY = os.getenv("MEET_STREAM_API_KEY")
 MEETSTREAM_BASE_URL = "https://api.meetstream.ai/api/v1"
@@ -27,6 +31,7 @@ _openai_client = None
 def _get_openai():
     global _openai_client
     if _openai_client is None:
+        logger.info("Initializing OpenAI client")
         _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     return _openai_client
 
@@ -72,19 +77,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "send_email",
+            "name": "fetch_emails",
             "description": (
-                "Send an email via Gmail. Use when someone says "
-                "'send an email to', 'email them about', 'write to', etc."
+                "Fetch emails from Gmail. Use when someone says "
+                "'check my emails', 'read my inbox', 'any new emails', "
+                "'show unread messages', etc."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "to": {"type": "string", "description": "Recipient email address"},
-                    "subject": {"type": "string", "description": "Email subject line"},
-                    "body": {"type": "string", "description": "Email body text"},
+                    "query": {
+                        "type": "string",
+                        "description": "Gmail search query, e.g. 'is:unread', 'from:boss@company.com', 'subject:meeting'",
+                        "default": "is:unread",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max number of emails to fetch",
+                        "default": 5,
+                    },
                 },
-                "required": ["to", "subject", "body"],
+                "required": [],
             },
         },
     },
@@ -92,7 +105,7 @@ TOOLS = [
 
 SYSTEM_PROMPT = (
     "You are an AI meeting assistant that listens to live meeting transcriptions. "
-    "When participants request actions like scheduling meetings or sending emails, "
+    "When participants request actions like scheduling meetings or checking emails, "
     "call the appropriate tool with the extracted parameters. "
     "If the transcription does not contain an actionable request, respond with "
     "a short JSON: {\"action\": \"none\"}. "
@@ -104,6 +117,7 @@ SYSTEM_PROMPT = (
 
 def detect_and_execute(transcription_text: str) -> dict | None:
     """Feed transcription into OpenAI, detect intents, execute actions."""
+    logger.debug(f"[INTENT] Sending to OpenAI: {transcription_text[:300]}")
     try:
         response = _get_openai().chat.completions.create(
             model="gpt-4o-mini",
@@ -119,16 +133,18 @@ def detect_and_execute(transcription_text: str) -> dict | None:
         return None
 
     message = response.choices[0].message
+    logger.debug(f"[INTENT] OpenAI response: tool_calls={message.tool_calls is not None}, content={message.content[:200] if message.content else 'None'}")
 
     if not message.tool_calls:
-        logger.info("No action detected in transcription")
+        logger.info("[INTENT] No action detected in transcription")
         return None
 
     results = []
     for tool_call in message.tool_calls:
         fn_name = tool_call.function.name
         args = json.loads(tool_call.function.arguments)
-        logger.info(f"Detected action: {fn_name} with args: {args}")
+        logger.info(f"[ACTION] Detected: {fn_name}")
+        logger.debug(f"[ACTION] Args: {json.dumps(args, indent=2)}")
 
         try:
             if fn_name == "schedule_meeting":
@@ -140,20 +156,22 @@ def detect_and_execute(transcription_text: str) -> dict | None:
                     description=args.get("description"),
                     timezone=args.get("timezone", "America/Los_Angeles"),
                 )
+                logger.info(f"[ACTION] Calendar event created: {args['title']}")
+                logger.debug(f"[ACTION] Calendar result: {result}")
                 results.append({"action": "schedule_meeting", "result": str(result)})
-                print(f"\n  Calendar event created: {args['title']}\n")
 
-            elif fn_name == "send_email":
-                result = send_email(
-                    to=args["to"],
-                    subject=args["subject"],
-                    body=args["body"],
+            elif fn_name == "fetch_emails":
+                logger.info(f"[ACTION] Fetching emails: query={args.get('query', 'is:unread')}")
+                result = fetch_emails(
+                    query=args.get("query", "is:unread"),
+                    max_results=args.get("max_results", 5),
                 )
-                results.append({"action": "send_email", "result": str(result)})
-                print(f"\n  Email sent to {args['to']}: {args['subject']}\n")
+                logger.info(f"[ACTION] Emails fetched successfully")
+                logger.debug(f"[ACTION] Email result: {result}")
+                results.append({"action": "fetch_emails", "result": str(result)})
 
         except Exception as e:
-            logger.error(f"Failed to execute {fn_name}: {e}")
+            logger.error(f"[ACTION] Failed to execute {fn_name}: {e}", exc_info=True)
             results.append({"action": fn_name, "error": str(e)})
 
     return results
@@ -192,34 +210,32 @@ def startup_auth_check():
 def webhook():
     data = request.get_json(silent=True)
     if not data:
+        logger.warning("[WEBHOOK] Received empty payload")
         return "", 200
 
     event = data.get("event", "")
-    logger.info(f"Webhook event: {event}")
+    bot_id = data.get("bot_id", "unknown")
+    logger.info(f"[WEBHOOK] Event: {event} | Bot: {bot_id}")
+    logger.debug(f"[WEBHOOK] Full payload: {json.dumps(data, indent=2)}")
 
     if not event.startswith("transcription."):
+        logger.debug(f"[WEBHOOK] Ignoring non-transcription event: {event}")
         return "", 200
 
     # Extract transcription text from the webhook payload
     transcription_text = data.get("data", {}).get("transcript", "")
     if not transcription_text:
-        # Try alternative payload shapes
         transcription_text = data.get("transcript", "")
     if not transcription_text:
         transcription_text = json.dumps(data.get("data", {}))
 
-    bot_id = data.get("bot_id", "unknown")
-    logger.info(f"Transcription from bot {bot_id}: {transcription_text[:200]}")
+    logger.info(f"[TRANSCRIPT] Bot {bot_id}: {transcription_text[:300]}")
 
     results = detect_and_execute(transcription_text)
     if results:
-        print(
-            "\n"
-            "=" * 50 + "\n"
-            f"  Actions executed for bot {bot_id}:\n"
-            f"  {json.dumps(results, indent=2)}\n"
-            "=" * 50 + "\n"
-        )
+        logger.info(f"[RESULT] Actions executed for bot {bot_id}: {json.dumps(results, indent=2)}")
+    else:
+        logger.debug(f"[RESULT] No actions for this transcription")
 
     return "", 200
 
