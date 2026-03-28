@@ -12,6 +12,7 @@ logger = logging.getLogger("scalekit")
 IDENTIFIER = os.getenv("IDENTIFIER", "hackathon_user_1")
 CONNECTION_GMAIL = os.getenv("CONNECTION_NAME_GMAIL", "gmail")
 CONNECTION_CALENDAR = os.getenv("CONNECTION_NAME_CALENDAR", "googlecalendar")
+CONNECTION_SLACK = os.getenv("CONNECTION_NAME_SLACK", "slack")
 
 _client = None
 
@@ -116,4 +117,18 @@ def fetch_emails(query: str = "is:unread", max_results: int = 5) -> dict:
     )
     logger.info(f"[GMAIL] Fetched successfully")
     logger.debug(f"[GMAIL] Result: {result}")
+    return result
+
+
+def send_slack_message(channel: str, text: str) -> dict:
+    """Send a message to a Slack channel via Scalekit optimized tool."""
+    logger.info(f"[SLACK] Sending message to {channel}")
+    logger.debug(f"[SLACK] Message: {text[:200]}")
+    result = _get_actions().execute_tool(
+        tool_name="slack_send_message",
+        identifier=IDENTIFIER,
+        tool_input={"channel": channel, "text": text},
+    )
+    logger.info(f"[SLACK] Message sent successfully")
+    logger.debug(f"[SLACK] Result: {result}")
     return result

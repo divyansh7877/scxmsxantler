@@ -10,8 +10,10 @@ from scalekit_client import (
     ensure_connected,
     create_calendar_event,
     fetch_emails,
+    send_slack_message,
     CONNECTION_GMAIL,
     CONNECTION_CALENDAR,
+    CONNECTION_SLACK,
 )
 
 load_dotenv()
@@ -101,6 +103,31 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_slack_message",
+            "description": (
+                "Send a message to a Slack channel. Use when someone says "
+                "'send a message to slack', 'notify the team', 'post in channel', "
+                "'alert the team on slack', 'message the channel', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Slack channel name (e.g. '#general', '#engineering') or channel ID",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The message text to send",
+                    },
+                },
+                "required": ["channel", "text"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = (
@@ -170,6 +197,16 @@ def detect_and_execute(transcription_text: str) -> dict | None:
                 logger.debug(f"[ACTION] Email result: {result}")
                 results.append({"action": "fetch_emails", "result": str(result)})
 
+            elif fn_name == "send_slack_message":
+                logger.info(f"[ACTION] Sending Slack message to {args['channel']}")
+                result = send_slack_message(
+                    channel=args["channel"],
+                    text=args["text"],
+                )
+                logger.info(f"[ACTION] Slack message sent to {args['channel']}")
+                logger.debug(f"[ACTION] Slack result: {result}")
+                results.append({"action": "send_slack_message", "result": str(result)})
+
         except Exception as e:
             logger.error(f"[ACTION] Failed to execute {fn_name}: {e}", exc_info=True)
             results.append({"action": fn_name, "error": str(e)})
@@ -196,7 +233,7 @@ def startup_auth_check():
     """Verify Scalekit connections on startup. Non-fatal if credentials missing."""
     print("\nChecking Scalekit connections...")
     try:
-        for conn in [CONNECTION_GMAIL, CONNECTION_CALENDAR]:
+        for conn in [CONNECTION_GMAIL, CONNECTION_CALENDAR, CONNECTION_SLACK]:
             result = ensure_connected(conn)
             if result["status"] != "ACTIVE":
                 print(f"  WARNING: {conn} needs authorization -- visit the link above")

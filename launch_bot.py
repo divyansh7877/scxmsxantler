@@ -29,14 +29,33 @@ callback_url = f"{ngrok_url.rstrip('/')}/webhook"
 payload = {
     "meeting_link": meeting_link,
     "bot_name": "Do-It Agent",
-    "callback_url": callback_url,
+    "video_required": True,
+    "bot_message": "Hey Everyone :wave: , I'm Do-It Agent. I can send Slack messages, read emails, and manage your calendar.",
+    "bot_image_url": "https://www.malwarebytes.com/wp-content/uploads/sites/2/2024/08/Grok_logo.jpg",
     "agent_config_id": "4046c44f-57f1-4691-bdb6-ed432cbdcccc",
-    "live_transcription_required": {
-        "webhook_url": callback_url,
+    "callback_url": callback_url,
+    "custom_attributes": {
+        "tag": "Meetstream",
+        "sample": "testing",
     },
+  "socket_connection_url": {
+    "websocket_url": "wss://agent-meetstream-prd-main.meetstream.ai/bridge"
+  },
+  "live_audio_required": {
+    "websocket_url": "wss://agent-meetstream-prd-main.meetstream.ai/bridge/audio"
+  },
     "automatic_leave": {
-        "waiting_room_timeout": 600,
-        "everyone_left_timeout": 120,
+        "waiting_room_timeout": 100,
+        "everyone_left_timeout": 100,
+        "voice_inactivity_timeout": 100,
+        "in_call_recording_timeout": 14400,
+        "recording_permission_denied_timeout": 60,
+    },
+    "recording_config": {
+        "retention": {
+            "type": "timed",
+            "hours": 24,
+        },
     },
 }
 
