@@ -1,9 +1,10 @@
 import os
 import json
 import logging
+import threading
 
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from openai import OpenAI
 
 from scalekit_client import (
@@ -15,6 +16,7 @@ from scalekit_client import (
     CONNECTION_CALENDAR,
     CONNECTION_SLACK,
 )
+from meeting_summary import generate_meeting_summary
 
 load_dotenv()
 logging.basicConfig(
@@ -26,6 +28,7 @@ logger = logging.getLogger("do-it-agent")
 
 MEETSTREAM_API_KEY = os.getenv("MEET_STREAM_API_KEY")
 MEETSTREAM_BASE_URL = "https://api.meetstream.ai/api/v1"
+SUMMARY_SLACK_CHANNEL = os.getenv("SUMMARY_SLACK_CHANNEL", "#social")
 
 _openai_client = None
 
@@ -226,6 +229,19 @@ def get_bot_details(bot_id: str) -> dict:
     return resp.json().get("bot_details", {})
 
 
+def _generate_and_post_summary(bot_id: str, channel: str = "") -> dict:
+    """End-to-end: fetch audio -> transcribe -> summarize -> post to Slack."""
+    channel = channel or SUMMARY_SLACK_CHANNEL
+    result = generate_meeting_summary(bot_id)
+
+    slack_message = f":memo: *Meeting Summary* (bot `{bot_id}`)\n\n{result['summary']}"
+    slack_result = send_slack_message(channel=channel, text=slack_message)
+    logger.info(f"[SUMMARY] Posted meeting summary to {channel}")
+
+    result["slack_result"] = str(slack_result)
+    return result
+
+
 app = Flask(__name__)
 
 
@@ -255,6 +271,14 @@ def webhook():
     logger.info(f"[WEBHOOK] Event: {event} | Bot: {bot_id}")
     logger.debug(f"[WEBHOOK] Full payload: {json.dumps(data, indent=2)}")
 
+    if event == "audio.processed" and data.get("status") == "success":
+        logger.info(f"[WEBHOOK] Audio ready, generating summary for {bot_id}")
+        thread = threading.Thread(
+            target=_safe_generate_and_post_summary, args=(bot_id,), daemon=True
+        )
+        thread.start()
+        return "", 200
+
     if not event.startswith("transcription."):
         logger.debug(f"[WEBHOOK] Ignoring non-transcription event: {event}")
         return "", 200
@@ -275,6 +299,26 @@ def webhook():
         logger.debug(f"[RESULT] No actions for this transcription")
 
     return "", 200
+
+
+def _safe_generate_and_post_summary(bot_id: str):
+    """Wrapper that catches exceptions so the background thread doesn't crash."""
+    try:
+        _generate_and_post_summary(bot_id)
+    except Exception as e:
+        logger.error(f"[SUMMARY] Failed to generate summary for bot {bot_id}: {e}", exc_info=True)
+
+
+@app.route("/summary/<bot_id>", methods=["POST"])
+def trigger_summary(bot_id: str):
+    """Manually trigger a meeting summary for a given bot_id."""
+    channel = request.args.get("channel", SUMMARY_SLACK_CHANNEL)
+    try:
+        result = _generate_and_post_summary(bot_id, channel=channel)
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"[SUMMARY] Manual trigger failed for bot {bot_id}: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/health", methods=["GET"])

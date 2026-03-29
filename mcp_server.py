@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import httpx
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -15,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 from scalekit.client import ScalekitClient
 from scalekit.common.scalekit import TokenValidationOptions
+from meeting_summary import generate_meeting_summary as _run_meeting_summary
 
 load_dotenv()
 
@@ -35,6 +37,7 @@ SK_CLIENT_SECRET = os.getenv("SCALEKIT_CLIENT_SECRET", "")
 IDENTIFIER = os.getenv("IDENTIFIER", "hackathon_user_1")
 
 PROTECTED_RESOURCE_METADATA = os.getenv("PROTECTED_RESOURCE_METADATA", "")
+SUMMARY_SLACK_CHANNEL = os.getenv("SUMMARY_SLACK_CHANNEL", "#social")
 
 # --- ScaleKit client ---
 scalekit_client = ScalekitClient(
@@ -45,6 +48,61 @@ scalekit_client = ScalekitClient(
 
 # --- FastMCP server ---
 mcp = FastMCP(name="Do-It Agent MCP", version="1.0.0")
+
+
+# =====================================================================
+# Gmail query builder
+# =====================================================================
+
+def build_gmail_query(
+    sender: str = "",
+    to: str = "",
+    subject: str = "",
+    after: str = "",
+    before: str = "",
+    has_attachment: bool = False,
+    label: str = "",
+    is_unread: bool | None = None,
+    is_starred: bool | None = None,
+    is_important: bool | None = None,
+    category: str = "",
+    newer_than: str = "",
+    older_than: str = "",
+    raw_query: str = "",
+) -> str:
+    """Build a Gmail search query string from structured parameters."""
+    parts: list[str] = []
+    if raw_query:
+        parts.append(raw_query)
+    if sender:
+        parts.append(f"from:{sender}")
+    if to:
+        parts.append(f"to:{to}")
+    if subject:
+        parts.append(f"subject:{subject}")
+    if after:
+        parts.append(f"after:{after}")
+    if before:
+        parts.append(f"before:{before}")
+    if has_attachment:
+        parts.append("has:attachment")
+    if label:
+        parts.append(f"label:{label}")
+    if is_unread is True:
+        parts.append("is:unread")
+    elif is_unread is False:
+        parts.append("is:read")
+    if is_starred is True:
+        parts.append("is:starred")
+    if is_important is True:
+        parts.append("is:important")
+    if category:
+        parts.append(f"category:{category}")
+    if newer_than:
+        parts.append(f"newer_than:{newer_than}")
+    if older_than:
+        parts.append(f"older_than:{older_than}")
+    return " ".join(parts) if parts else "is:unread"
 
 
 # =====================================================================
@@ -193,47 +251,99 @@ async def mcp_metadata(request: Request) -> JSONResponse:
 # =====================================================================
 
 def _execute_tool(tool_name: str, tool_input: dict) -> dict:
-    logger.info("Executing ScaleKit tool: %s", tool_name)
-    result = scalekit_client.actions.execute_tool(
-        tool_name=tool_name,
-        identifier=IDENTIFIER,
-        tool_input=tool_input,
-    )
-    logger.info("Tool %s executed successfully", tool_name)
-    return result
+    logger.info("Executing ScaleKit tool: %s with input: %s", tool_name, json.dumps(tool_input))
+    try:
+        result = scalekit_client.actions.execute_tool(
+            tool_name=tool_name,
+            identifier=IDENTIFIER,
+            tool_input=tool_input,
+        )
+        logger.info("Tool %s executed successfully", tool_name)
+        return result
+    except Exception as e:
+        logger.error("Tool %s failed: %s", tool_name, e)
+        raise
 
 
 def _ensure_connected(connection_name: str) -> dict:
-    response = scalekit_client.actions.get_or_create_connected_account(
-        connection_name=connection_name,
-        identifier=IDENTIFIER,
-    )
-    account = response.connected_account
-    if account.status != "ACTIVE":
-        link_response = scalekit_client.actions.get_authorization_link(
+    try:
+        response = scalekit_client.actions.get_or_create_connected_account(
             connection_name=connection_name,
             identifier=IDENTIFIER,
         )
-        return {"connected": False, "link": link_response.link}
+    except Exception as e:
+        logger.error("Failed to check connection '%s': %s", connection_name, e)
+        return {"connected": False, "error": str(e)}
+
+    account = response.connected_account
+    if account.status != "ACTIVE":
+        try:
+            link_response = scalekit_client.actions.get_authorization_link(
+                connection_name=connection_name,
+                identifier=IDENTIFIER,
+            )
+            return {"connected": False, "link": link_response.link}
+        except Exception as e:
+            logger.error("Failed to get auth link for '%s': %s", connection_name, e)
+            return {"connected": False, "error": str(e)}
     return {"connected": True}
+
+
+def _check_connection_or_fail(connection_name: str) -> str | None:
+    """Returns an error message if not connected, None if connected."""
+    status = _ensure_connected(connection_name)
+    if not status["connected"]:
+        if "link" in status:
+            return f"{connection_name} not authorized. Authorize here: {status['link']}"
+        return f"{connection_name} connection error: {status.get('error', 'unknown')}"
+    return None
 
 
 # =====================================================================
 # MCP Tools
 # =====================================================================
 
-@mcp.tool()
-def send_slack_message(text: str) -> str:
-    """Send a message to the #social Slack channel."""
-    status = _ensure_connected("slack")
-    if not status["connected"]:
-        return f"Slack not authorized. Authorize here: {status['link']}"
-    result = _execute_tool("slack_send_message", {
-        "channel": "#social",
-        "text": text,
-    })
-    return json.dumps(result, default=str)
+# --- Connection Management ---
 
+@mcp.tool()
+def check_connections() -> str:
+    """Check the authorization status of all configured services (Gmail, Calendar, Slack).
+    Returns which services are active and which need authorization.
+    """
+    results = {}
+    for name in ["gmail", "googlecalendar", "slack"]:
+        try:
+            status = _ensure_connected(name)
+            results[name] = "active" if status["connected"] else status.get("link", status.get("error", "inactive"))
+        except Exception as e:
+            results[name] = f"error: {e}"
+    return json.dumps(results, indent=2)
+
+
+# --- Slack ---
+
+@mcp.tool()
+def send_slack_message(text: str, channel: str = "#social") -> str:
+    """Send a message to a Slack channel.
+
+    Args:
+        text: The message text to send.
+        channel: Slack channel name (default "#social"). Use "#channel-name" format.
+    """
+    err = _check_connection_or_fail("slack")
+    if err:
+        return err
+    try:
+        result = _execute_tool("slack_send_message", {
+            "channel": channel,
+            "text": text,
+        })
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return f"Failed to send Slack message: {e}"
+
+
+# --- Google Calendar ---
 
 @mcp.tool()
 def create_calendar_event(
@@ -241,21 +351,26 @@ def create_calendar_event(
     start_time: str,
     duration_minutes: int = 30,
     description: str = "",
+    attendees: list[str] | None = None,
     timezone: str = "America/Los_Angeles",
+    create_meeting_room: bool = False,
 ) -> str:
-    """Create a Google Calendar event.
+    """Create a Google Calendar event with optional attendees and video meeting.
 
     Args:
         title: Event title/summary.
         start_time: Start time in RFC3339 format (e.g. 2026-03-28T14:00:00-07:00).
         duration_minutes: Duration in minutes (default 30).
         description: Optional event description.
+        attendees: Optional list of attendee email addresses to invite.
         timezone: IANA timezone (default America/Los_Angeles).
+        create_meeting_room: If true, creates a Google Meet link for the event.
     """
-    status = _ensure_connected("googlecalendar")
-    if not status["connected"]:
-        return f"Google Calendar not authorized. Authorize here: {status['link']}"
-    tool_input = {
+    err = _check_connection_or_fail("googlecalendar")
+    if err:
+        return err
+
+    tool_input: dict = {
         "summary": title,
         "start_datetime": start_time,
         "event_duration_minutes": duration_minutes,
@@ -263,50 +378,194 @@ def create_calendar_event(
     }
     if description:
         tool_input["description"] = description
-    result = _execute_tool("googlecalendar_create_event", tool_input)
-    return json.dumps(result, default=str)
+    if attendees:
+        tool_input["attendees_emails"] = attendees
+    if create_meeting_room:
+        tool_input["create_meeting_room"] = True
+
+    try:
+        result = _execute_tool("googlecalendar_create_event", tool_input)
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return f"Failed to create calendar event: {e}"
 
 
 @mcp.tool()
 def list_calendar_events(
-    max_results: int = 5,
+    max_results: int = 10,
     time_min: str = "",
+    time_max: str = "",
 ) -> str:
-    """List upcoming Google Calendar events.
+    """List upcoming Google Calendar events with optional time range filtering.
 
     Args:
-        max_results: Maximum number of events to return (default 5).
-        time_min: Optional start time filter in RFC3339 format.
+        max_results: Maximum number of events to return (default 10).
+        time_min: Only return events starting at or after this time (RFC3339 format).
+        time_max: Only return events starting before this time (RFC3339 format).
     """
-    status = _ensure_connected("googlecalendar")
-    if not status["connected"]:
-        return f"Google Calendar not authorized. Authorize here: {status['link']}"
-    tool_input = {"max_results": max_results}
+    err = _check_connection_or_fail("googlecalendar")
+    if err:
+        return err
+
+    tool_input: dict = {"max_results": max_results}
     if time_min:
         tool_input["time_min"] = time_min
-    result = _execute_tool("googlecalendar_list_events", tool_input)
-    return json.dumps(result, default=str)
+    if time_max:
+        tool_input["time_max"] = time_max
 
+    try:
+        result = _execute_tool("googlecalendar_list_events", tool_input)
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return f"Failed to list calendar events: {e}"
+
+
+# --- Gmail ---
 
 @mcp.tool()
 def fetch_emails(
     query: str = "is:unread",
-    max_results: int = 5,
+    max_results: int = 10,
 ) -> str:
-    """Fetch emails from Gmail.
+    """Fetch emails from Gmail using a raw Gmail search query.
+
+    Use standard Gmail search syntax. Examples:
+      - "is:unread" (default)
+      - "from:boss@company.com is:unread"
+      - "subject:invoice after:2026/03/01"
+      - "has:attachment from:hr@company.com"
+      - "label:important newer_than:2d"
 
     Args:
-        query: Gmail search query (default "is:unread").
-        max_results: Maximum number of emails to fetch (default 5).
+        query: Gmail search query string (default "is:unread").
+        max_results: Maximum number of emails to fetch (default 10).
     """
-    status = _ensure_connected("gmail")
-    if not status["connected"]:
-        return f"Gmail not authorized. Authorize here: {status['link']}"
-    result = _execute_tool("gmail_fetch_mails", {
-        "query": query,
-        "max_results": max_results,
-    })
-    return json.dumps(result, default=str)
+    err = _check_connection_or_fail("gmail")
+    if err:
+        return err
+
+    try:
+        result = _execute_tool("gmail_fetch_mails", {
+            "query": query,
+            "max_results": max_results,
+        })
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return f"Failed to fetch emails: {e}"
+
+
+@mcp.tool()
+def search_emails(
+    sender: str = "",
+    to: str = "",
+    subject: str = "",
+    after: str = "",
+    before: str = "",
+    has_attachment: bool = False,
+    label: str = "",
+    is_unread: bool | None = None,
+    is_starred: bool | None = None,
+    is_important: bool | None = None,
+    category: str = "",
+    newer_than: str = "",
+    older_than: str = "",
+    max_results: int = 10,
+) -> str:
+    """Search Gmail with structured filters. Builds the query automatically.
+
+    This is an easier alternative to fetch_emails when you want to
+    filter by specific fields rather than writing raw Gmail query syntax.
+
+    Args:
+        sender: Filter by sender email or name (e.g. "alice@example.com").
+        to: Filter by recipient email or name.
+        subject: Filter by subject keywords.
+        after: Only emails after this date (YYYY/MM/DD format, e.g. "2026/03/01").
+        before: Only emails before this date (YYYY/MM/DD format).
+        has_attachment: If true, only return emails with attachments.
+        label: Filter by Gmail label (e.g. "inbox", "important", "work").
+        is_unread: If true, only unread emails. If false, only read. If omitted, both.
+        is_starred: If true, only starred emails.
+        is_important: If true, only important emails.
+        category: Gmail category filter (e.g. "primary", "social", "promotions", "updates", "forums").
+        newer_than: Relative time filter (e.g. "1d", "2w", "3m" for 1 day, 2 weeks, 3 months).
+        older_than: Relative time filter (e.g. "1d", "2w", "3m").
+        max_results: Maximum number of emails to fetch (default 10).
+    """
+    err = _check_connection_or_fail("gmail")
+    if err:
+        return err
+
+    query = build_gmail_query(
+        sender=sender,
+        to=to,
+        subject=subject,
+        after=after,
+        before=before,
+        has_attachment=has_attachment,
+        label=label,
+        is_unread=is_unread,
+        is_starred=is_starred,
+        is_important=is_important,
+        category=category,
+        newer_than=newer_than,
+        older_than=older_than,
+    )
+
+    logger.info("search_emails built query: %s", query)
+
+    try:
+        result = _execute_tool("gmail_fetch_mails", {
+            "query": query,
+            "max_results": max_results,
+        })
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return f"Failed to search emails: {e}"
+
+
+# --- Meeting Summary ---
+
+@mcp.tool()
+def generate_meeting_summary(
+    bot_id: str,
+    channel: str = "#social",
+) -> str:
+    """Generate a meeting summary from a MeetStream bot recording and post it to Slack.
+
+    Fetches the bot's recorded audio from MeetStream, transcribes it using AssemblyAI,
+    generates a concise summary using Minimax, and posts the result to a Slack channel.
+
+    Args:
+        bot_id: The MeetStream bot ID (returned when the bot was created).
+        channel: Slack channel to post the summary to (default "#social").
+    """
+    try:
+        result = _run_meeting_summary(bot_id)
+        summary = result["summary"]
+
+        err = _check_connection_or_fail("slack")
+        if err:
+            return f"Summary generated but could not post to Slack: {err}\n\n{summary}"
+
+        slack_message = f":memo: *Meeting Summary* (bot `{bot_id}`)\n\n{summary}"
+        slack_result = _execute_tool("slack_send_message", {
+            "channel": channel,
+            "text": slack_message,
+        })
+
+        logger.info("Meeting summary posted to %s", channel)
+        return json.dumps({
+            "bot_id": bot_id,
+            "transcript_length": result["transcript_length"],
+            "summary": summary,
+            "slack_channel": channel,
+            "slack_result": str(slack_result),
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("Meeting summary failed for bot %s: %s", bot_id, e)
+        return f"Failed to generate meeting summary: {e}"
 
 
 # =====================================================================
